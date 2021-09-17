@@ -8,6 +8,9 @@
 
 using BindPtr = int (*)(int, const sockaddr *, socklen_t);
 
+constexpr auto RELOCATION_PLT_SECTION = ".rela.plt";
+constexpr auto BIND_SYMBOL = "bind";
+
 BindPtr origin = nullptr;
 
 int bind_wrapper(int fd, const sockaddr *address, socklen_t length) {
@@ -51,11 +54,11 @@ int init() {
             reader.sections.begin(),
             reader.sections.end(),
             [](const auto& s) {
-                return s->get_name() == ".rela.plt";
+                return s->get_name() == RELOCATION_PLT_SECTION;
             });
 
     if (it == reader.sections.end()) {
-        LOG_ERROR("can't find relocation section");
+        LOG_ERROR("can't find relocation plt section");
         return -1;
     }
 
@@ -82,7 +85,7 @@ int init() {
         baseAddress = processMap.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
     }
 
-    ELFIO::Elf64_Addr bindGotEntry = 0;
+    ELFIO::Elf64_Addr gotEntry = 0;
     ELFIO::relocation_section_accessor relocations(reader, *it);
 
     for (ELFIO::Elf_Xword i = 0; i < relocations.get_entries_num(); i++) {
@@ -98,29 +101,29 @@ int init() {
             return -1;
         }
 
-        if (symbolName == "bind") {
-            bindGotEntry = baseAddress + offset;
+        if (symbolName == BIND_SYMBOL) {
+            gotEntry = baseAddress + offset;
             break;
         }
     }
 
-    if (!bindGotEntry) {
-        LOG_ERROR("can't find bind got entry");
+    if (!gotEntry) {
+        LOG_ERROR("can't find bind got table entry");
         return -1;
     }
 
-    LOG_INFO("bind got entry address: 0x%lx", bindGotEntry);
+    LOG_INFO("bind got table entry: 0x%lx", gotEntry);
 
-    unsigned long start = bindGotEntry & ~(PAGE_SIZE - 1);
-    unsigned long end = (bindGotEntry + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
+    unsigned long start = gotEntry & ~(PAGE_SIZE - 1);
+    unsigned long end = (gotEntry + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
 
     if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) < 0) {
-        LOG_ERROR("set code page writeable attr failed");
+        LOG_ERROR("change memory protection failed");
         return -1;
     }
 
-    origin = *(BindPtr *)bindGotEntry;
-    *(BindPtr *)bindGotEntry = bind_wrapper;
+    origin = *(BindPtr *)gotEntry;
+    *(BindPtr *)gotEntry = bind_wrapper;
 
     return 0;
 }
