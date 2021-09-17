@@ -13,18 +13,18 @@ constexpr auto BIND_SYMBOL = "bind";
 
 BindPtr origin = nullptr;
 
-int bind_wrapper(int fd, const sockaddr *address, socklen_t length) {
+int shadow_bind(int fd, const sockaddr *address, socklen_t length) {
     if (address->sa_family != AF_INET) {
         return origin(fd, address, length);
     }
 
-    auto *s = (sockaddr_in *)address;
+    in_port_t *port = &((sockaddr_in *)address)->sin_port;
 
-    if (s->sin_port != htons(9229)) {
+    if (*port != htons(9229)) {
         return origin(fd, address, length);
     }
 
-    s->sin_port = htons(29229);
+    *port = htons(29229);
 
     return origin(fd, address, length);
 }
@@ -32,11 +32,11 @@ int bind_wrapper(int fd, const sockaddr *address, socklen_t length) {
 int init() {
     INIT_CONSOLE_LOG(INFO);
 
-    std::string file = CPath::getAPPPath();
+    std::string path = CPath::getApplicationPath();
 
     CProcessMap processMap;
 
-    if (!CProcess::getFileMemoryBase(getpid(), file, processMap)) {
+    if (!CProcess::getImageBase(getpid(), path, processMap)) {
         LOG_ERROR("find node image base failed");
         return -1;
     }
@@ -45,8 +45,8 @@ int init() {
 
     ELFIO::elfio reader;
 
-    if (!reader.load(file)) {
-        LOG_ERROR("open elf failed: %s", file.c_str());
+    if (!reader.load(path)) {
+        LOG_ERROR("open elf failed: %s", path.c_str());
         return -1;
     }
 
@@ -108,11 +108,11 @@ int init() {
     }
 
     if (!gotEntry) {
-        LOG_ERROR("can't find bind got table entry");
+        LOG_ERROR("can't find bind got entry");
         return -1;
     }
 
-    LOG_INFO("bind got table entry: 0x%lx", gotEntry);
+    LOG_INFO("bind got entry: 0x%lx", gotEntry);
 
     unsigned long start = gotEntry & ~(PAGE_SIZE - 1);
     unsigned long end = (gotEntry + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
@@ -123,7 +123,7 @@ int init() {
     }
 
     origin = *(BindPtr *)gotEntry;
-    *(BindPtr *)gotEntry = bind_wrapper;
+    *(BindPtr *)gotEntry = shadow_bind;
 
     return 0;
 }
