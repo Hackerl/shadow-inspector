@@ -1,47 +1,85 @@
 #include "library.h"
 #include <elfio/elfio.hpp>
-#include <common/log.h>
-#include <common/utils/process.h>
+#include <zero/log.h>
+#include <zero/proc/process.h>
+#include <zero/filesystem/path.h>
 #include <sys/user.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <regex>
 
 using BindPtr = int (*)(int, const sockaddr *, socklen_t);
 
 constexpr auto RELOCATION_PLT_SECTION = ".rela.plt";
 constexpr auto BIND_SYMBOL = "bind";
+constexpr auto CMDLINE_PATH = "/proc/self/cmdline";
 
-BindPtr origin = nullptr;
+constexpr auto DEFAULT_PORT = 9229;
+constexpr auto SHADOW_PORT = 29229;
+
+static bool enabled = false;
+static BindPtr origin = nullptr;
+
+short getInspectorPort() {
+    std::ifstream stream = std::ifstream(CMDLINE_PATH);
+    std::string cmdline((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+
+    std::smatch sm;
+    std::regex re(R"(inspect(?:-brk)?=(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}:)?(\d+))");
+
+    short port = 0;
+
+    if (std::regex_search(cmdline, sm, re) && zero::strings::toNumber(sm.str(1), port))
+        return port;
+
+    const char *env = getenv("NODE_OPTIONS");
+
+    if (!env)
+        return DEFAULT_PORT;
+
+    std::cmatch cm;
+
+    if (std::regex_search(env, cm, re) && zero::strings::toNumber(cm.str(1), port))
+        return port;
+
+    return DEFAULT_PORT;
+}
 
 int shadow_bind(int fd, const sockaddr *address, socklen_t length) {
-    if (address->sa_family != AF_INET) {
+    if (enabled)
         return origin(fd, address, length);
-    }
+
+    if (address->sa_family != AF_INET)
+        return origin(fd, address, length);
 
     in_port_t *port = &((sockaddr_in *)address)->sin_port;
+    in_port_t inspectorPort = getInspectorPort();
 
-    if (*port != htons(9229)) {
+    LOG_INFO("check inspector port: %hd %hd", ntohs(*port), inspectorPort);
+
+    if (*port != htons(inspectorPort))
         return origin(fd, address, length);
-    }
 
-    *port = htons(29229);
+    enabled = true;
+    *port = htons(SHADOW_PORT);
 
     return origin(fd, address, length);
 }
 
 int init() {
-    INIT_CONSOLE_LOG(INFO);
+    INIT_CONSOLE_LOG(zero::INFO);
 
-    std::string path = CPath::getApplicationPath();
+    std::string path = zero::filesystem::path::getApplicationPath();
 
-    CProcessMap processMap;
+    zero::proc::CProcessMapping processMapping;
 
-    if (!CProcess::getImageBase(getpid(), path, processMap)) {
+    if (!zero::proc::getImageBase(getpid(), path, processMapping)) {
         LOG_ERROR("find node image base failed");
         return -1;
     }
 
-    LOG_INFO("node image base: 0x%lx", processMap.start);
+    LOG_INFO("node image base: 0x%lx", processMapping.start);
 
     ELFIO::elfio reader;
 
@@ -82,7 +120,7 @@ int init() {
                     return i->get_virtual_address() < j->get_virtual_address();
                 });
 
-        baseAddress = processMap.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
+        baseAddress = processMapping.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
     }
 
     ELFIO::Elf64_Addr gotEntry = 0;
