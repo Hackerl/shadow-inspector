@@ -175,7 +175,7 @@ int init() {
     }
 
     uintptr_t start = address & ~(PAGE_SIZE - 1);
-    uintptr_t end = (address + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
+    uintptr_t end = (address + sizeof(BindPtr) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) < 0) {
         LOG_ERROR("change memory protection failed");
