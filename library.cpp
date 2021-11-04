@@ -46,37 +46,14 @@ short getInspectorPort() {
     return DEFAULT_PORT;
 }
 
-int shadow_bind(int fd, const sockaddr *address, socklen_t length) {
-    if (enabled)
-        return origin(fd, address, length);
-
-    if (address->sa_family != AF_INET)
-        return origin(fd, address, length);
-
-    in_port_t *port = &((sockaddr_in *)address)->sin_port;
-    in_port_t inspectorPort = getInspectorPort();
-
-    LOG_INFO("check inspector port: %hd %hd", ntohs(*port), inspectorPort);
-
-    if (*port != htons(inspectorPort))
-        return origin(fd, address, length);
-
-    enabled = true;
-    *port = htons(SHADOW_PORT);
-
-    return origin(fd, address, length);
-}
-
-int init() {
-    INIT_CONSOLE_LOG(zero::INFO);
-
+bool getGOTEntry(const std::string &symbol, uintptr_t &address) {
     std::string path = zero::filesystem::path::getApplicationPath();
 
-    zero::proc::CProcessMapping processMapping;
+    zero::proc::CProcessMapping processMapping = {};
 
     if (!zero::proc::getImageBase(getpid(), path, processMapping)) {
         LOG_ERROR("find node image base failed");
-        return -1;
+        return false;
     }
 
     LOG_INFO("node image base: 0x%lx", processMapping.start);
@@ -85,7 +62,7 @@ int init() {
 
     if (!reader.load(path)) {
         LOG_ERROR("open elf failed: %s", path.c_str());
-        return -1;
+        return false;
     }
 
     auto it = std::find_if(
@@ -97,7 +74,7 @@ int init() {
 
     if (it == reader.sections.end()) {
         LOG_ERROR("can't find relocation plt section");
-        return -1;
+        return false;
     }
 
     unsigned long baseAddress = 0;
@@ -123,45 +100,95 @@ int init() {
         baseAddress = processMapping.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
     }
 
-    ELFIO::Elf64_Addr gotEntry = 0;
     ELFIO::relocation_section_accessor relocations(reader, *it);
 
     for (ELFIO::Elf_Xword i = 0; i < relocations.get_entries_num(); i++) {
-        ELFIO::Elf64_Addr offset;
-        ELFIO::Elf64_Addr symbolValue;
+        ELFIO::Elf64_Addr offset = 0;
+        ELFIO::Elf64_Addr symbolValue = 0;
         std::string symbolName;
-        ELFIO::Elf_Word type;
-        ELFIO::Elf_Sxword addend;
-        ELFIO::Elf_Sxword calcValue;
+        ELFIO::Elf_Word type = 0;
+        ELFIO::Elf_Sxword addend = 0;
+        ELFIO::Elf_Sxword calcValue = 0;
 
         if (!relocations.get_entry(i, offset, symbolValue, symbolName, type, addend, calcValue)) {
             LOG_ERROR("get relocation entry %lu failed", i);
-            return -1;
+            return false;
         }
 
         if (symbolName == BIND_SYMBOL) {
-            gotEntry = baseAddress + offset;
+            address = baseAddress + offset;
             break;
         }
     }
 
-    if (!gotEntry) {
-        LOG_ERROR("can't find bind got entry");
+    return address != 0;
+}
+
+int shadow_bind(int fd, const sockaddr *address, socklen_t length) {
+    if (enabled)
+        return origin(fd, address, length);
+
+    if (address->sa_family != AF_INET)
+        return origin(fd, address, length);
+
+    in_port_t *port = &((sockaddr_in *)address)->sin_port;
+    in_port_t inspectorPort = getInspectorPort();
+
+    LOG_INFO("check inspector port: %hd %hd", ntohs(*port), inspectorPort);
+
+    if (*port != htons(inspectorPort))
+        return origin(fd, address, length);
+
+    enabled = true;
+    *port = htons(SHADOW_PORT);
+
+    return origin(fd, address, length);
+}
+
+int init() {
+    INIT_CONSOLE_LOG(zero::INFO);
+
+    uintptr_t address = 0;
+
+    if (!getGOTEntry(BIND_SYMBOL, address)) {
+        LOG_ERROR("can't find bind GOT entry");
         return -1;
     }
 
-    LOG_INFO("bind got entry: 0x%lx", gotEntry);
+    LOG_INFO("bind GOT entry: 0x%lx", address);
 
-    unsigned long start = gotEntry & ~(PAGE_SIZE - 1);
-    unsigned long end = (gotEntry + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
+    zero::proc::CProcessMapping processMapping = {};
+
+    if (!zero::proc::getAddressMapping(getpid(), address, processMapping)) {
+        LOG_ERROR("can't find GOT entry memory mapping");
+        return -1;
+    }
+
+    int protection = (processMapping.permissions & zero::proc::READ_PERMISSION ? PROT_READ : 0) |
+                     (processMapping.permissions & zero::proc::WRITE_PERMISSION ? PROT_WRITE : 0) |
+                     (processMapping.permissions & zero::proc::EXECUTE_PERMISSION ? PROT_EXEC : 0);
+
+    if ((protection & PROT_READ) && (protection & PROT_WRITE)) {
+        origin = *(BindPtr *)address;
+        *(BindPtr *)address = shadow_bind;
+        return 0;
+    }
+
+    uintptr_t start = address & ~(PAGE_SIZE - 1);
+    uintptr_t end = (address + sizeof(BindPtr) + PAGE_SIZE) & ~(PAGE_SIZE - 1);
 
     if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) < 0) {
         LOG_ERROR("change memory protection failed");
         return -1;
     }
 
-    origin = *(BindPtr *)gotEntry;
-    *(BindPtr *)gotEntry = shadow_bind;
+    origin = *(BindPtr *)address;
+    *(BindPtr *)address = shadow_bind;
+
+    if (mprotect((void *)start, end - start, protection) < 0) {
+        LOG_ERROR("change memory protection failed");
+        return -1;
+    }
 
     return 0;
 }
